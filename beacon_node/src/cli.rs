@@ -1,11 +1,5 @@
 use clap::{App, Arg};
 
-// Default text included in blocks.
-// Must be 32-bytes or will not build.
-//
-//                              |-------must be this long------|
-const DEFAULT_GRAFFITI: &str = "sigp/lighthouse-0.1.2-prerelease";
-
 pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
     App::new("beacon_node")
         .visible_aliases(&["b", "bn", "beacon"])
@@ -77,8 +71,8 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
             Arg::with_name("boot-nodes")
                 .long("boot-nodes")
                 .allow_hyphen_values(true)
-                .value_name("ENR-LIST")
-                .help("One or more comma-delimited base64-encoded ENR's to bootstrap the p2p network.")
+                .value_name("ENR/MULTIADDR LIST")
+                .help("One or more comma-delimited base64-encoded ENR's to bootstrap the p2p network. Multiaddr is also supported.")
                 .takes_value(true),
         )
         .arg(
@@ -248,9 +242,24 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
         .arg(
             Arg::with_name("graffiti")
                 .long("graffiti")
-                .help("Specify your custom graffiti to be included in blocks.")
+                .help(
+                    "Specify your custom graffiti to be included in blocks. \
+                    Defaults to the current version and commit, truncated to fit in 32 bytes. "
+                )
                 .value_name("GRAFFITI")
-                .default_value(DEFAULT_GRAFFITI)
                 .takes_value(true)
+        )
+        .arg(
+            Arg::with_name("max-skip-slots")
+                .long("max-skip-slots")
+                .help(
+                    "Refuse to skip more than this many slots when processing a block or attestation. \
+                    This prevents nodes on minority forks from wasting our time and RAM, \
+                    but might need to be raised or set to 'none' in times of extreme network \
+                    outage."
+                )
+                .value_name("NUM_SLOTS")
+                .takes_value(true)
+                .default_value("700")
         )
 }

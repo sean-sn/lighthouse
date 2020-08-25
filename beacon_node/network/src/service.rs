@@ -54,9 +54,11 @@ pub enum NetworkMessage<T: EthSpec> {
     },
     /// Publish a list of messages to the gossipsub protocol.
     Publish { messages: Vec<PubsubMessage<T>> },
-    /// Propagate a received gossipsub message.
-    Propagate {
+    /// Validates a received gossipsub message. This will propagate the message on the network.
+    Validate {
+        /// The peer that sent us the message. We don't send back to this peer.
         propagation_source: PeerId,
+        /// The id of the message we are validating and propagating.
         message_id: MessageId,
     },
     /// Reports a peer to the peer manager for performing an action.
@@ -93,7 +95,7 @@ pub struct NetworkService<T: BeaconChainTypes> {
 
 impl<T: BeaconChainTypes> NetworkService<T> {
     #[allow(clippy::type_complexity)]
-    pub fn start(
+    pub async fn start(
         beacon_chain: Arc<BeaconChain<T>>,
         config: &NetworkConfig,
         executor: environment::TaskExecutor,
@@ -115,7 +117,7 @@ impl<T: BeaconChainTypes> NetworkService<T> {
 
         // launch libp2p service
         let (network_globals, mut libp2p) =
-            LibP2PService::new(executor.clone(), config, enr_fork_id, &network_log)?;
+            LibP2PService::new(executor.clone(), config, enr_fork_id, &network_log).await?;
 
         // Repopulate the DHT with stored ENR's.
         let enrs_to_load = load_dht::<T::EthSpec, T::HotStore, T::ColdStore>(store.clone());
@@ -124,7 +126,7 @@ impl<T: BeaconChainTypes> NetworkService<T> {
             "Loading peers into the routing table"; "peers" => enrs_to_load.len()
         );
         for enr in enrs_to_load {
-            libp2p.swarm.add_enr(enr.clone());
+            libp2p.swarm.add_enr(enr.clone()); //TODO change?
         }
 
         // launch derived network services
@@ -143,7 +145,7 @@ impl<T: BeaconChainTypes> NetworkService<T> {
             AttestationService::new(beacon_chain.clone(), network_globals.clone(), &network_log);
 
         // create the network service and spawn the task
-        let network_log = network_log.new(o!("service"=> "network"));
+        let network_log = network_log.new(o!("service" => "network"));
         let network_service = NetworkService {
             beacon_chain,
             libp2p,
@@ -167,6 +169,7 @@ fn spawn_service<T: BeaconChainTypes>(
     mut service: NetworkService<T>,
 ) -> error::Result<()> {
     let mut exit_rx = executor.exit();
+    let mut shutdown_sender = executor.shutdown_sender();
 
     // spawn on the current executor
     executor.spawn_without_exit(async move {
@@ -213,7 +216,7 @@ fn spawn_service<T: BeaconChainTypes>(
                         NetworkMessage::SendError{ peer_id, error, id, reason } => {
                             service.libp2p.respond_with_error(peer_id, id, error, reason);
                         }
-                        NetworkMessage::Propagate {
+                        NetworkMessage::Validate {
                             propagation_source,
                             message_id,
                         } => {
@@ -224,7 +227,7 @@ fn spawn_service<T: BeaconChainTypes>(
                                 service
                                     .libp2p
                                     .swarm
-                                    .propagate_message(&propagation_source, message_id);
+                                    .validate_message(&propagation_source, message_id);
                         }
                         NetworkMessage::Publish { messages } => {
                                 let mut topic_kinds = Vec::new();
@@ -269,8 +272,8 @@ fn spawn_service<T: BeaconChainTypes>(
                         AttServiceMessage::EnrRemove(subnet_id) => {
                             service.libp2p.swarm.update_enr_subnet(subnet_id, false);
                         }
-                        AttServiceMessage::DiscoverPeers{subnet_id, min_ttl} => {
-                            service.libp2p.swarm.discover_subnet_peers(subnet_id, min_ttl);
+                        AttServiceMessage::DiscoverPeers(subnets_to_discover) => {
+                            service.libp2p.swarm.discover_subnet_peers(subnets_to_discover);
                         }
                     }
                 }
@@ -373,6 +376,12 @@ fn spawn_service<T: BeaconChainTypes>(
                         }
                         Libp2pEvent::NewListenAddr(multiaddr) => {
                             service.network_globals.listen_multiaddrs.write().push(multiaddr);
+                        }
+                        Libp2pEvent::ZeroListeners => {
+                            let _ = shutdown_sender.send("All listeners are closed. Unable to listen").await.map_err(|e| {
+                                warn!(service.log, "failed to send a shutdown signal"; "error" => e.to_string()
+                                )
+                            });
                         }
                     }
                 }

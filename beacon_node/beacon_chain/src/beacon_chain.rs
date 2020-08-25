@@ -3,9 +3,11 @@ use crate::attestation_verification::{
     VerifiedUnaggregatedAttestation,
 };
 use crate::block_verification::{
-    check_block_relevancy, get_block_root, signature_verify_chain_segment, BlockError,
-    FullyVerifiedBlock, GossipVerifiedBlock, IntoFullyVerifiedBlock,
+    check_block_is_finalized_descendant, check_block_relevancy, get_block_root,
+    signature_verify_chain_segment, BlockError, FullyVerifiedBlock, GossipVerifiedBlock,
+    IntoFullyVerifiedBlock,
 };
+use crate::chain_config::ChainConfig;
 use crate::errors::{BeaconChainError as Error, BlockProductionError};
 use crate::eth1_chain::{Eth1Chain, Eth1ChainBackend};
 use crate::events::{EventHandler, EventKind};
@@ -70,15 +72,14 @@ pub const ETH1_CACHE_DB_KEY: [u8; 32] = [0; 32];
 pub const FORK_CHOICE_DB_KEY: [u8; 32] = [0; 32];
 
 /// The result of a chain segment processing.
-#[derive(Debug)]
-pub enum ChainSegmentResult {
+pub enum ChainSegmentResult<T: EthSpec> {
     /// Processing this chain segment finished successfully.
     Successful { imported_blocks: usize },
     /// There was an error processing this chain segment. Before the error, some blocks could
     /// have been imported.
     Failed {
         imported_blocks: usize,
-        error: BlockError,
+        error: BlockError<T>,
     },
 }
 
@@ -161,6 +162,8 @@ pub trait BeaconChainTypes: Send + Sync + 'static {
 /// operations and chooses a canonical head.
 pub struct BeaconChain<T: BeaconChainTypes> {
     pub spec: ChainSpec,
+    /// Configuration for `BeaconChain` runtime behaviour.
+    pub config: ChainConfig,
     /// Persistent storage for blocks, states, etc. Typically an on-disk store, such as LevelDB.
     pub store: Arc<HotColdDB<T::EthSpec, T::HotStore, T::ColdStore>>,
     /// Database migrator for running background maintenance on the store.
@@ -175,7 +178,7 @@ pub struct BeaconChain<T: BeaconChainTypes> {
     ///
     /// This pool accepts `Attestation` objects that only have one aggregation bit set and provides
     /// a method to get an aggregated `Attestation` for some `AttestationData`.
-    pub naive_aggregation_pool: NaiveAggregationPool<T::EthSpec>,
+    pub naive_aggregation_pool: RwLock<NaiveAggregationPool<T::EthSpec>>,
     /// Contains a store of attestations which have been observed by the beacon chain.
     pub observed_attestations: ObservedAttestations<T::EthSpec>,
     /// Maintains a record of which validators have been seen to attest in recent epochs.
@@ -747,7 +750,10 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         &self,
         data: &AttestationData,
     ) -> Result<Option<Attestation<T::EthSpec>>, Error> {
-        self.naive_aggregation_pool.get(data).map_err(Into::into)
+        self.naive_aggregation_pool
+            .read()
+            .get(data)
+            .map_err(Into::into)
     }
 
     /// Produce an unaggregated `Attestation` that is valid for the given `slot` and `index`.
@@ -937,7 +943,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
         let attestation = unaggregated_attestation.attestation();
 
-        match self.naive_aggregation_pool.insert(attestation) {
+        match self.naive_aggregation_pool.write().insert(attestation) {
             Ok(outcome) => trace!(
                 self.log,
                 "Stored unaggregated attestation";
@@ -1153,7 +1159,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn process_chain_segment(
         &self,
         chain_segment: Vec<SignedBeaconBlock<T::EthSpec>>,
-    ) -> ChainSegmentResult {
+    ) -> ChainSegmentResult<T::EthSpec> {
         let mut filtered_chain_segment = Vec::with_capacity(chain_segment.len());
         let mut imported_blocks = 0;
 
@@ -1212,6 +1218,14 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 // However, we will potentially get a `ParentUnknown` on a later block. The sync
                 // protocol will need to ensure this is handled gracefully.
                 Err(BlockError::WouldRevertFinalizedSlot { .. }) => continue,
+                // The block has a known parent that does not descend from the finalized block.
+                // There is no need to process this block or any children.
+                Err(BlockError::NotFinalizedDescendant { block_parent_root }) => {
+                    return ChainSegmentResult::Failed {
+                        imported_blocks,
+                        error: BlockError::NotFinalizedDescendant { block_parent_root },
+                    }
+                }
                 // If there was an error whilst determining if the block was invalid, return that
                 // error.
                 Err(BlockError::BeaconChainError(e)) => {
@@ -1286,7 +1300,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn verify_block_for_gossip(
         &self,
         block: SignedBeaconBlock<T::EthSpec>,
-    ) -> Result<GossipVerifiedBlock<T>, BlockError> {
+    ) -> Result<GossipVerifiedBlock<T>, BlockError<T::EthSpec>> {
         let slot = block.message.slot;
         let graffiti_string = String::from_utf8(block.message.body.graffiti[..].to_vec())
             .unwrap_or_else(|_| format!("{:?}", &block.message.body.graffiti[..]));
@@ -1307,7 +1321,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 debug!(
                     self.log,
                     "Rejected gossip block";
-                    "error" => format!("{:?}", e),
+                    "error" => e.to_string(),
                     "graffiti" => graffiti_string,
                     "slot" => slot,
                 );
@@ -1332,7 +1346,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn process_block<B: IntoFullyVerifiedBlock<T>>(
         &self,
         unverified_block: B,
-    ) -> Result<Hash256, BlockError> {
+    ) -> Result<Hash256, BlockError<T::EthSpec>> {
         // Start the Prometheus timer.
         let _full_timer = metrics::start_timer(&metrics::BLOCK_PROCESSING_TIMES);
 
@@ -1343,7 +1357,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         let block = unverified_block.block().clone();
 
         // A small closure to group the verification and import errors.
-        let import_block = |unverified_block: B| -> Result<Hash256, BlockError> {
+        let import_block = |unverified_block: B| -> Result<Hash256, BlockError<T::EthSpec>> {
             let fully_verified = unverified_block.into_fully_verified_block(self)?;
             self.import_block(fully_verified)
         };
@@ -1390,11 +1404,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 trace!(
                     self.log,
                     "Beacon block rejected";
-                    "reason" => format!("{:?}", other),
+                    "reason" => other.to_string(),
                 );
 
                 let _ = self.event_handler.register(EventKind::BeaconBlockRejected {
-                    reason: format!("Invalid block: {:?}", other),
+                    reason: format!("Invalid block: {}", other),
                     block: Box::new(block),
                 });
 
@@ -1411,9 +1425,8 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     fn import_block(
         &self,
         fully_verified_block: FullyVerifiedBlock<T>,
-    ) -> Result<Hash256, BlockError> {
+    ) -> Result<Hash256, BlockError<T::EthSpec>> {
         let signed_block = fully_verified_block.block;
-        let block = &signed_block.message;
         let block_root = fully_verified_block.block_root;
         let state = fully_verified_block.state;
         let parent_block = fully_verified_block.parent_block;
@@ -1425,7 +1438,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
 
         // Iterate through the attestations in the block and register them as an "observed
         // attestation". This will stop us from propagating them on the gossip network.
-        for a in &block.body.attestations {
+        for a in &signed_block.message.body.attestations {
             match self.observed_attestations.observe_attestation(a, None) {
                 // If the observation was successful or if the slot for the attestation was too
                 // low, continue.
@@ -1474,6 +1487,11 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         }
 
         let mut fork_choice = self.fork_choice.write();
+
+        // Do not import a block that doesn't descend from the finalized root.
+        let signed_block =
+            check_block_is_finalized_descendant::<T, _>(signed_block, &fork_choice, &self.store)?;
+        let block = &signed_block.message;
 
         // Register the new block with the fork choice service.
         {
@@ -1562,12 +1580,13 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         &self,
         randao_reveal: Signature,
         slot: Slot,
+        validator_graffiti: Option<Graffiti>,
     ) -> Result<BeaconBlockAndState<T::EthSpec>, BlockProductionError> {
         let state = self
             .state_at_slot(slot - 1, StateSkipConfig::WithStateRoots)
             .map_err(|_| BlockProductionError::UnableToProduceAtSlot(slot))?;
 
-        self.produce_block_on_state(state, slot, randao_reveal)
+        self.produce_block_on_state(state, slot, randao_reveal, validator_graffiti)
     }
 
     /// Produce a block for some `slot` upon the given `state`.
@@ -1583,6 +1602,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
         mut state: BeaconState<T::EthSpec>,
         produce_at_slot: Slot,
         randao_reveal: Signature,
+        validator_graffiti: Option<Graffiti>,
     ) -> Result<BeaconBlockAndState<T::EthSpec>, BlockProductionError> {
         metrics::inc_counter(&metrics::BLOCK_PRODUCTION_REQUESTS);
         let timer = metrics::start_timer(&metrics::BLOCK_PRODUCTION_TIMES);
@@ -1632,6 +1652,30 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 })
         };
 
+        // Iterate through the naive aggregation pool and ensure all the attestations from there
+        // are included in the operation pool.
+        for attestation in self.naive_aggregation_pool.read().iter() {
+            if let Err(e) = self.op_pool.insert_attestation(
+                attestation.clone(),
+                &state.fork,
+                state.genesis_validators_root,
+                &self.spec,
+            ) {
+                // Don't stop block production if there's an error, just create a log.
+                error!(
+                    self.log,
+                    "Attestation did not transfer to op pool";
+                    "reason" => format!("{:?}", e)
+                );
+            }
+        }
+
+        // Override the beacon node's graffiti with graffiti from the validator, if present.
+        let graffiti = match validator_graffiti {
+            Some(graffiti) => graffiti,
+            None => self.graffiti,
+        };
+
         let mut block = SignedBeaconBlock {
             message: BeaconBlock {
                 slot: state.slot,
@@ -1641,7 +1685,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
                 body: BeaconBlockBody {
                     randao_reveal,
                     eth1_data,
-                    graffiti: self.graffiti,
+                    graffiti,
                     proposer_slashings: proposer_slashings.into(),
                     attester_slashings: attester_slashings.into(),
                     attestations: self
@@ -1852,7 +1896,7 @@ impl<T: BeaconChainTypes> BeaconChain<T> {
     pub fn per_slot_task(&self) {
         trace!(self.log, "Running beacon chain per slot tasks");
         if let Some(slot) = self.slot_clock.now() {
-            self.naive_aggregation_pool.prune(slot);
+            self.naive_aggregation_pool.write().prune(slot);
         }
     }
 
@@ -2133,8 +2177,8 @@ impl From<BeaconStateError> for Error {
     }
 }
 
-impl ChainSegmentResult {
-    pub fn into_block_error(self) -> Result<(), BlockError> {
+impl<T: EthSpec> ChainSegmentResult<T> {
+    pub fn into_block_error(self) -> Result<(), BlockError<T>> {
         match self {
             ChainSegmentResult::Failed { error, .. } => Err(error),
             ChainSegmentResult::Successful { .. } => Ok(()),

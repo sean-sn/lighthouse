@@ -1,35 +1,44 @@
-#[macro_use]
-extern crate clap;
-
 use beacon_node::ProductionBeaconNode;
 use clap::{App, Arg, ArgMatches};
 use env_logger::{Builder, Env};
 use environment::EnvironmentBuilder;
-use eth2_testnet_config::HARDCODED_TESTNET;
-use git_version::git_version;
+use eth2_testnet_config::{Eth2TestnetConfig, DEFAULT_HARDCODED_TESTNET};
+use lighthouse_version::VERSION;
 use slog::{crit, info, warn};
 use std::path::PathBuf;
 use std::process::exit;
 use types::EthSpec;
 use validator_client::ProductionValidatorClient;
 
-pub const VERSION: &str = git_version!(
-    args = ["--always", "--dirty=(modified)"],
-    prefix = concat!(crate_version!(), "-"),
-    fallback = crate_version!()
-);
 pub const DEFAULT_DATA_DIR: &str = ".lighthouse";
 pub const ETH2_CONFIG_FILENAME: &str = "eth2-spec.toml";
+
+fn bls_library_name() -> &'static str {
+    if cfg!(feature = "portable") {
+        "blst-portable"
+    } else if cfg!(feature = "milagro") {
+        "milagro"
+    } else {
+        "blst"
+    }
+}
 
 fn main() {
     // Parse the CLI parameters.
     let matches = App::new("Lighthouse")
-        .version(VERSION)
+        .version(VERSION.replace("Lighthouse/", "").as_str())
         .author("Sigma Prime <contact@sigmaprime.io>")
         .setting(clap::AppSettings::ColoredHelp)
         .about(
             "Ethereum 2.0 client by Sigma Prime. Provides a full-featured beacon \
              node, a validator client and utilities for managing validator accounts.",
+        )
+        .long_version(
+            format!(
+                "{}\n\
+                 BLS Library: {}",
+                 VERSION.replace("Lighthouse/", ""), bls_library_name()
+            ).as_str()
         )
         .arg(
             Arg::with_name("spec")
@@ -54,7 +63,7 @@ fn main() {
                 .long("logfile")
                 .value_name("FILE")
                 .help(
-                    "File path where output will be written. Default file logging format is JSON.",
+                    "File path where output will be written.",
                 )
                 .takes_value(true),
         )
@@ -97,6 +106,17 @@ fn main() {
                 )
                 .takes_value(true)
                 .global(true),
+        )
+        .arg(
+            Arg::with_name("testnet")
+                .long("testnet")
+                .value_name("testnet")
+                .help("Name of network lighthouse will connect to")
+                .possible_values(&["medalla", "altona"])
+                .conflicts_with("testnet-dir")
+                .takes_value(true)
+                .global(true)
+
         )
         .subcommand(beacon_node::cli_app())
         .subcommand(boot_node::cli_app())
@@ -167,23 +187,31 @@ fn run<E: EthSpec>(
 
     let log_format = matches.value_of("log-format");
 
-    let optional_testnet_config =
-        clap_utils::parse_testnet_dir_with_hardcoded_default(matches, "testnet-dir")?;
+    // Parse testnet config from the `testnet` and `testnet-dir` flag in that order
+    // else, use the default
+    let mut optional_testnet_config = Eth2TestnetConfig::hard_coded_default()?;
+    if matches.is_present("testnet") {
+        optional_testnet_config = clap_utils::parse_hardcoded_network(matches, "testnet")?;
+    };
+    if matches.is_present("testnet-dir") {
+        optional_testnet_config = clap_utils::parse_testnet_dir(matches, "testnet-dir")?;
+    };
 
-    let mut environment = environment_builder
-        .async_logger(debug_level, log_format)?
+    let builder = if let Some(log_path) = matches.value_of("logfile") {
+        let path = log_path
+            .parse::<PathBuf>()
+            .map_err(|e| format!("Failed to parse log path: {:?}", e))?;
+        environment_builder.log_to_file(path, debug_level, log_format)?
+    } else {
+        environment_builder.async_logger(debug_level, log_format)?
+    };
+
+    let mut environment = builder
         .multi_threaded_tokio_runtime()?
         .optional_eth2_testnet_config(optional_testnet_config)?
         .build()?;
 
     let log = environment.core_context().log().clone();
-
-    if let Some(log_path) = matches.value_of("logfile") {
-        let path = log_path
-            .parse::<PathBuf>()
-            .map_err(|e| format!("Failed to parse log path: {:?}", e))?;
-        environment.log_to_json_file(path, debug_level, log_format)?;
-    }
 
     // Note: the current code technically allows for starting a beacon node _and_ a validator
     // client at the same time.
@@ -193,7 +221,19 @@ fn run<E: EthSpec>(
     //
     // Creating a command which can run both might be useful future works.
 
+    // Print an indication of which network is currently in use.
+    let optional_testnet = clap_utils::parse_optional::<String>(matches, "testnet")?;
+    let optional_testnet_dir = clap_utils::parse_optional::<PathBuf>(matches, "testnet-dir")?;
+
+    let testnet_name = match (optional_testnet, optional_testnet_dir) {
+        (Some(testnet), None) => testnet,
+        (None, Some(testnet_dir)) => format!("custom ({})", testnet_dir.display()),
+        (None, None) => DEFAULT_HARDCODED_TESTNET.to_string(),
+        (Some(_), Some(_)) => panic!("CLI prevents both --testnet and --testnet-dir"),
+    };
+
     if let Some(sub_matches) = matches.subcommand_matches("account_manager") {
+        eprintln!("Running account manager for {} testnet", testnet_name);
         // Pass the entire `environment` to the account manager so it can run blocking operations.
         account_manager::run(sub_matches, environment)?;
 
@@ -205,14 +245,12 @@ fn run<E: EthSpec>(
         log,
         "Ethereum 2.0 is pre-release. This software is experimental."
     );
-
-    if !matches.is_present("testnet-dir") {
-        info!(
-            log,
-            "Using default testnet";
-            "default" => HARDCODED_TESTNET
-        )
-    }
+    info!(log, "Lighthouse started"; "version" => VERSION);
+    info!(
+        log,
+        "Configured for testnet";
+        "name" => testnet_name
+    );
 
     let beacon_node = if let Some(sub_matches) = matches.subcommand_matches("beacon_node") {
         let runtime_context = environment.core_context();
@@ -262,8 +300,8 @@ fn run<E: EthSpec>(
         return Err("No subcommand supplied.".into());
     }
 
-    // Block this thread until Crtl+C is pressed.
-    environment.block_until_ctrl_c()?;
+    // Block this thread until we get a ctrl-c or a task sends a shutdown signal.
+    environment.block_until_shutdown_requested()?;
     info!(log, "Shutting down..");
 
     environment.fire_signal();

@@ -4,13 +4,13 @@ pub use self::peerdb::*;
 use crate::discovery::{Discovery, DiscoveryEvent};
 use crate::rpc::{GoodbyeReason, MetaData, Protocol, RPCError, RPCResponseErrorCode};
 use crate::{error, metrics};
-use crate::{Enr, EnrExt, NetworkConfig, NetworkGlobals, PeerId};
+use crate::{EnrExt, NetworkConfig, NetworkGlobals, PeerId, SubnetDiscovery};
 use futures::prelude::*;
 use futures::Stream;
 use hashset_delay::HashSetDelay;
 use libp2p::core::multiaddr::Protocol as MProtocol;
 use libp2p::identify::IdentifyInfo;
-use slog::{crit, debug, error, warn};
+use slog::{crit, debug, error};
 use smallvec::SmallVec;
 use std::{
     net::SocketAddr,
@@ -19,7 +19,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use types::{EthSpec, SubnetId};
+use types::EthSpec;
 
 pub use libp2p::core::{identity::Keypair, Multiaddr};
 
@@ -32,6 +32,7 @@ pub(crate) mod score;
 pub use peer_info::{PeerConnectionStatus::*, PeerInfo};
 pub use peer_sync_status::{PeerSyncStatus, SyncInfo};
 use score::{PeerAction, ScoreState};
+use std::collections::HashMap;
 /// The time in seconds between re-status's peers.
 const STATUS_INTERVAL: u64 = 300;
 /// The time in seconds between PING events. We do not send a ping if the other peer as PING'd us within
@@ -39,7 +40,7 @@ const STATUS_INTERVAL: u64 = 300;
 const PING_INTERVAL: u64 = 30;
 
 /// The heartbeat performs regular updates such as updating reputations and performing discovery
-/// requests. This defines the interval in seconds.  
+/// requests. This defines the interval in seconds.
 const HEARTBEAT_INTERVAL: u64 = 30;
 
 /// A fraction of `PeerManager::target_peers` that we allow to connect to us in excess of
@@ -87,14 +88,14 @@ pub enum PeerManagerEvent {
 
 impl<TSpec: EthSpec> PeerManager<TSpec> {
     // NOTE: Must be run inside a tokio executor.
-    pub fn new(
+    pub async fn new(
         local_key: &Keypair,
         config: &NetworkConfig,
         network_globals: Arc<NetworkGlobals<TSpec>>,
         log: &slog::Logger,
     ) -> error::Result<Self> {
         // start the discovery service
-        let mut discovery = Discovery::new(local_key, config, network_globals.clone(), log)?;
+        let mut discovery = Discovery::new(local_key, config, network_globals.clone(), log).await?;
 
         // start searching for peers
         discovery.discover_peers();
@@ -158,7 +159,7 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
             info.score.apply_peer_action(action);
             if previous_state != info.score.state() {
                 match info.score.state() {
-                    ScoreState::Ban => {
+                    ScoreState::Banned => {
                         debug!(self.log, "Peer has been banned"; "peer_id" => peer_id.to_string(), "score" => info.score.to_string());
                         ban_peer = Some(peer_id.clone());
                         if info.connection_status.is_connected_or_dialing() {
@@ -168,7 +169,7 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
                             ));
                         }
                     }
-                    ScoreState::Disconnect => {
+                    ScoreState::Disconnected => {
                         debug!(self.log, "Peer transitioned to disconnect state"; "peer_id" => peer_id.to_string(), "score" => info.score.to_string(), "past_state" => previous_state.to_string());
                         // disconnect the peer if it's currently connected or dialing
                         unban_peer = Some(peer_id.clone());
@@ -212,17 +213,19 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
     }
 
     /// A request to find peers on a given subnet.
-    pub fn discover_subnet_peers(&mut self, subnet_id: SubnetId, min_ttl: Option<Instant>) {
+    pub fn discover_subnet_peers(&mut self, subnets_to_discover: Vec<SubnetDiscovery>) {
         // Extend the time to maintain peers if required.
-        if let Some(min_ttl) = min_ttl {
-            self.network_globals
-                .peers
-                .write()
-                .extend_peers_on_subnet(subnet_id, min_ttl);
+        for s in subnets_to_discover.iter() {
+            if let Some(min_ttl) = s.min_ttl {
+                self.network_globals
+                    .peers
+                    .write()
+                    .extend_peers_on_subnet(s.subnet_id, min_ttl);
+            }
         }
 
         // request the subnet query from discovery
-        self.discovery.discover_subnet_peers(subnet_id, min_ttl);
+        self.discovery.discover_subnet_peers(subnets_to_discover);
     }
 
     /// A STATUS message has been received from a peer. This resets the status timer.
@@ -306,7 +309,7 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
     pub fn handle_rpc_error(&mut self, peer_id: &PeerId, protocol: Protocol, err: &RPCError) {
         let client = self.network_globals.client(peer_id);
         let score = self.network_globals.peers.read().score(peer_id);
-        warn!(self.log, "RPC Error"; "protocol" => protocol.to_string(), "err" => err.to_string(), "client" => client.to_string(), "peer_id" => peer_id.to_string(), "score" => score.to_string());
+        debug!(self.log, "RPC Error"; "protocol" => protocol.to_string(), "err" => err.to_string(), "client" => client.to_string(), "peer_id" => peer_id.to_string(), "score" => score.to_string());
 
         // Map this error to a `PeerAction` (if any)
         let peer_action = match err {
@@ -330,6 +333,7 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
                 RPCResponseErrorCode::Unknown => PeerAction::HighToleranceError,
                 RPCResponseErrorCode::ServerError => PeerAction::MidToleranceError,
                 RPCResponseErrorCode::InvalidRequest => PeerAction::LowToleranceError,
+                RPCResponseErrorCode::RateLimited => PeerAction::LowToleranceError,
             },
             RPCError::SSZDecodeError(_) => PeerAction::Fatal,
             RPCError::UnsupportedProtocol => {
@@ -358,6 +362,14 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
                 Protocol::Status => return,
             },
             RPCError::NegotiationTimeout => PeerAction::HighToleranceError,
+            RPCError::RateLimited => match protocol {
+                Protocol::Ping => PeerAction::MidToleranceError,
+                Protocol::BlocksByRange => PeerAction::HighToleranceError,
+                Protocol::BlocksByRoot => PeerAction::HighToleranceError,
+                Protocol::Goodbye => PeerAction::LowToleranceError,
+                Protocol::MetaData => PeerAction::LowToleranceError,
+                Protocol::Status => PeerAction::LowToleranceError,
+            },
         };
 
         self.report_peer(peer_id, peer_action);
@@ -487,13 +499,11 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
     /// with a new `PeerId` which involves a discovery routing table lookup. We could dial the
     /// multiaddr here, however this could relate to duplicate PeerId's etc. If the lookup
     /// proves resource constraining, we should switch to multiaddr dialling here.
-    fn peers_discovered(&mut self, peers: &[Enr], min_ttl: Option<Instant>) {
+    fn peers_discovered(&mut self, results: HashMap<PeerId, Option<Instant>>) {
         let mut to_dial_peers = Vec::new();
 
         let connected_or_dialing = self.network_globals.connected_or_dialing_peers();
-        for enr in peers {
-            let peer_id = enr.peer_id();
-
+        for (peer_id, min_ttl) in results {
             // we attempt a connection if this peer is a subnet peer or if the max peer count
             // is not yet filled (including dialling peers)
             if (min_ttl.is_some() || connected_or_dialing + to_dial_peers.len() < self.max_peers)
@@ -502,7 +512,11 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
                     .peers
                     .read()
                     .is_connected_or_dialing(&peer_id)
-                && !self.network_globals.peers.read().is_banned(&peer_id)
+                && !self
+                    .network_globals
+                    .peers
+                    .read()
+                    .is_banned_or_disconnected(&peer_id)
             {
                 // TODO: Update output
                 // This should be updated with the peer dialing. In fact created once the peer is
@@ -527,11 +541,8 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
     ///
     /// This is called by `connect_ingoing` and `connect_outgoing`.
     ///
-    /// This informs if the peer was accepted in to the db or not.
+    /// Informs if the peer was accepted in to the db or not.
     fn connect_peer(&mut self, peer_id: &PeerId, connection: ConnectingType) -> bool {
-        // TODO: remove after timed updates
-        //self.update_reputations();
-
         {
             let mut peerdb = self.network_globals.peers.write();
             if peerdb.connection_status(peer_id).map(|c| c.is_banned()) == Some(true) {
@@ -630,7 +641,7 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
             // handle score transitions
             if previous_state != info.score.state() {
                 match info.score.state() {
-                    ScoreState::Ban => {
+                    ScoreState::Banned => {
                         debug!(self.log, "Peer has been banned"; "peer_id" => peer_id.to_string(), "score" => info.score.to_string());
                         to_ban_peers.push(peer_id.clone());
                         if info.connection_status.is_connected_or_dialing() {
@@ -640,7 +651,7 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
                             ));
                         }
                     }
-                    ScoreState::Disconnect => {
+                    ScoreState::Disconnected => {
                         debug!(self.log, "Peer transitioned to disconnect state"; "peer_id" => peer_id.to_string(), "score" => info.score.to_string(), "past_state" => previous_state.to_string());
                         // disconnect the peer if it's currently connected or dialing
                         to_unban_peers.push(peer_id.clone());
@@ -678,7 +689,8 @@ impl<TSpec: EthSpec> PeerManager<TSpec> {
     /// NOTE: Discovery will only add a new query if one isn't already queued.
     fn heartbeat(&mut self) {
         // TODO: Provide a back-off time for discovery queries. I.e Queue many initially, then only
-        // perform discoveries over a larger fixed interval. Perhaps one every 6 heartbeats
+        // perform discoveries over a larger fixed interval. Perhaps one every 6 heartbeats. This
+        // is achievable with a leaky bucket
         let peer_count = self.network_globals.connected_or_dialing_peers();
         if peer_count < self.target_peers {
             // If we need more peers, queue a discovery lookup.
@@ -726,9 +738,7 @@ impl<TSpec: EthSpec> Stream for PeerManager<TSpec> {
         while let Poll::Ready(event) = self.discovery.poll(cx) {
             match event {
                 DiscoveryEvent::SocketUpdated(socket_addr) => self.socket_updated(socket_addr),
-                DiscoveryEvent::QueryResult(min_ttl, peers) => {
-                    self.peers_discovered(&peers, min_ttl)
-                }
+                DiscoveryEvent::QueryResult(results) => self.peers_discovered(results),
             }
         }
 

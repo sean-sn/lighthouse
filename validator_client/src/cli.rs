@@ -40,7 +40,7 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
             Arg::with_name("strict-lockfiles")
             .long("strict-lockfiles")
             .help(
-                "If present, do not load validators that have are guarded by a lockfile. Note: for \
+                "If present, do not load validators that are guarded by a lockfile. Note: for \
                 Eth2 mainnet, this flag will likely be removed and its behaviour will become default."
             )
         )
@@ -59,5 +59,13 @@ pub fn cli_app<'a, 'b>() -> App<'a, 'b> {
                     "If present, the validator client will still poll for duties if the beacon
                       node is not synced.",
                 ),
+        )
+        // This overwrites the graffiti configured in the beacon node.
+        .arg(
+            Arg::with_name("graffiti")
+                .long("graffiti")
+                .help("Specify your custom graffiti to be included in blocks.")
+                .value_name("GRAFFITI")
+                .takes_value(true)
         )
 }

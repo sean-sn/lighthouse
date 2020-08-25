@@ -7,12 +7,12 @@ mod fork_service;
 mod initialized_validators;
 mod is_synced;
 mod notifier;
-mod validator_definitions;
 mod validator_store;
 
 pub use cli::cli_app;
 pub use config::Config;
 
+use account_utils::validator_definitions::ValidatorDefinitions;
 use attestation_service::{AttestationService, AttestationServiceBuilder};
 use block_service::{BlockService, BlockServiceBuilder};
 use clap::ArgMatches;
@@ -29,7 +29,6 @@ use slot_clock::SystemTimeSlotClock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{delay_for, Duration};
 use types::EthSpec;
-use validator_definitions::ValidatorDefinitions;
 use validator_store::ValidatorStore;
 
 /// The interval between attempts to contact the beacon node during startup.
@@ -217,6 +216,7 @@ impl<T: EthSpec> ProductionValidatorClient<T> {
             .validator_store(validator_store.clone())
             .beacon_node(beacon_node.clone())
             .runtime_context(context.service_context("block".into()))
+            .graffiti(config.graffiti)
             .build()?;
 
         let attestation_service = AttestationServiceBuilder::new()

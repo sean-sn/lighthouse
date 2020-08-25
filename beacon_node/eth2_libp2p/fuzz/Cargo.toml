@@ -32,6 +32,10 @@ members = ["."]
 name = "fuzz_ssz_snappy_codec"
 path = "fuzz_targets/fuzz_ssz_snappy_codec.rs"
 
+[[bin]]
+name = "fuzz_ssz_snappy_codec_out"
+path = "fuzz_targets/fuzz_ssz_snappy_codec_out.rs"
+
 [patch]
 [patch.crates-io]
 tree_hash = { path = "../../../consensus/tree_hash" }

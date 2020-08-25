@@ -36,7 +36,7 @@ pub mod methods;
 mod protocol;
 mod rate_limiter;
 
-pub use codec::SSZSnappyInboundCodec;
+pub use codec::{SSZSnappyInboundCodec, SSZSnappyOutboundCodec};
 
 /// RPC events sent from Lighthouse.
 #[derive(Debug, Clone)]

@@ -9,7 +9,7 @@ mod attestation_service;
 mod beacon_processor;
 mod metrics;
 mod persisted_dht;
-mod router;
+pub mod router;
 mod sync;
 
 pub use eth2_libp2p::NetworkConfig;

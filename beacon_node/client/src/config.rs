@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use types::Graffiti;
 
-pub const DEFAULT_DATADIR: &str = ".lighthouse";
+pub const DEFAULT_DATADIR: &str = ".mallory";
 
 /// The number initial validators when starting the `Minimal`.
 const TESTNET_SPEC_CONSTANTS: &str = "minimal";

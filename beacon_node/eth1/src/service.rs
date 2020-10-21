@@ -6,7 +6,6 @@ use crate::{
         get_block, get_block_number, get_deposit_logs_in_range, get_network_id, Eth1NetworkId, Log,
     },
     inner::{DepositUpdater, Inner},
-    DepositLog,
 };
 use futures::{future::TryFutureExt, stream, stream::TryStreamExt, StreamExt};
 use parking_lot::{RwLock, RwLockReadGuard};
@@ -148,6 +147,7 @@ impl Service {
                 deposit_cache: RwLock::new(DepositUpdater::new(
                     config.deposit_contract_deploy_block,
                 )),
+                remote_head_block: RwLock::new(None),
                 config: RwLock::new(config),
                 spec,
             }),
@@ -204,6 +204,21 @@ impl Service {
     /// Returns the timestamp of the latest block in the cache (if any).
     pub fn latest_block_timestamp(&self) -> Option<u64> {
         self.inner.block_cache.read().latest_block_timestamp()
+    }
+
+    /// Returns the latest head block returned from an Eth1 node.
+    ///
+    /// ## Note
+    ///
+    /// This is the simply the head of the Eth1 chain, with no regard to follow distance or the
+    /// voting period start.
+    pub fn head_block(&self) -> Option<Eth1Block> {
+        self.inner.remote_head_block.read().as_ref().cloned()
+    }
+
+    /// Returns the latest cached block.
+    pub fn latest_cached_block(&self) -> Option<Eth1Block> {
+        self.inner.block_cache.read().latest_block().cloned()
     }
 
     /// Returns the lowest block number stored.
@@ -301,6 +316,18 @@ impl Service {
     pub async fn update(
         &self,
     ) -> Result<(DepositCacheUpdateOutcome, BlockCacheUpdateOutcome), String> {
+        let endpoint = &self.config().endpoint.clone();
+        let remote_head_block_number =
+            get_block_number(endpoint, Duration::from_millis(BLOCK_NUMBER_TIMEOUT_MILLIS))
+                .map_err(Error::GetBlockNumberFailed)
+                .map_err(|e| format!("Failed to update Eth1 service: {:?}", e))
+                .await?;
+        let remote_head_block = download_eth1_block(self.inner.clone(), remote_head_block_number)
+            .map_err(|e| format!("Failed to update Eth1 service: {:?}", e))
+            .await?;
+
+        *self.inner.remote_head_block.write() = Some(remote_head_block);
+
         let update_deposit_cache = async {
             let outcome = self
                 .update_deposit_cache()
@@ -314,7 +341,7 @@ impl Service {
                 "logs_imported" => outcome.logs_imported,
                 "last_processed_eth1_block" => self.inner.deposit_cache.read().last_processed_block,
             );
-            Ok(outcome)
+            Ok::<_, String>(outcome)
         };
 
         let update_block_cache = async {
@@ -330,10 +357,13 @@ impl Service {
                 "blocks_imported" => outcome.blocks_imported,
                 "head_block" => outcome.head_block_number,
             );
-            Ok(outcome)
+            Ok::<_, String>(outcome)
         };
 
-        futures::try_join!(update_deposit_cache, update_block_cache)
+        let (deposit_outcome, block_outcome) =
+            futures::try_join!(update_deposit_cache, update_block_cache)?;
+
+        Ok((deposit_outcome, block_outcome))
     }
 
     /// A looping future that updates the cache, then waits `config.auto_update_interval` before
@@ -483,7 +513,7 @@ impl Service {
             log_chunk
                 .iter()
                 .map(|raw_log| {
-                    DepositLog::from_log(&raw_log, self.inner.spec()).map_err(|error| {
+                    raw_log.to_deposit_log(self.inner.spec()).map_err(|error| {
                         Error::FailedToParseDepositLog {
                             block_range: block_range.clone(),
                             error,

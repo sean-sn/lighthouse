@@ -1,5 +1,6 @@
 use crate::metrics;
 use eth1::{Config as Eth1Config, Eth1Block, Service as HttpService};
+use eth2::lighthouse::Eth1SyncStatusData;
 use eth2_hashing::hash;
 use slog::{debug, error, trace, Logger};
 use ssz::{Decode, Encode};
@@ -9,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::iter::DoubleEndedIterator;
 use std::marker::PhantomData;
+use std::time::{SystemTime, UNIX_EPOCH};
 use store::{DBColumn, Error as StoreError, StoreItem};
 use task_executor::TaskExecutor;
 use types::{
@@ -18,6 +20,9 @@ use types::{
 
 type BlockNumber = u64;
 type Eth1DataVoteCount = HashMap<(Eth1Data, BlockNumber), u64>;
+
+/// We will declare ourself synced with the Eth1 chain, even if we are this many blocks behind.
+const ETH1_SYNC_TOLERANCE: u64 = 8;
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,6 +56,71 @@ impl From<safe_arith::ArithError> for Error {
     fn from(e: safe_arith::ArithError) -> Self {
         Self::ArithError(e)
     }
+}
+
+fn get_sync_status<T: EthSpec>(
+    latest_cached_block: Option<&Eth1Block>,
+    head_block: Option<&Eth1Block>,
+    genesis_time: u64,
+    current_slot: Slot,
+    spec: &ChainSpec,
+) -> Option<Eth1SyncStatusData> {
+    let period = T::SlotsPerEth1VotingPeriod::to_u64();
+    let voting_period_start_slot = (current_slot / period) * period;
+    let voting_period_start_timestamp = {
+        let period_start = slot_start_seconds::<T>(
+            genesis_time,
+            spec.milliseconds_per_slot,
+            voting_period_start_slot,
+        );
+        let eth1_follow_distance_seconds = spec
+            .seconds_per_eth1_block
+            .saturating_mul(spec.eth1_follow_distance);
+
+        period_start.saturating_sub(eth1_follow_distance_seconds)
+    };
+
+    let latest_cached_block_number = latest_cached_block.map(|b| b.number);
+    let latest_cached_block_timestamp = latest_cached_block.map(|b| b.timestamp);
+    let head_block_number = head_block.map(|b| b.number);
+    let head_block_timestamp = head_block.map(|b| b.timestamp);
+
+    let eth1_node_sync_status_percentage = if let Some(head_block) = head_block {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let head_age = now.saturating_sub(head_block.timestamp);
+
+        if head_age < ETH1_SYNC_TOLERANCE * spec.seconds_per_eth1_block {
+            100.0
+        } else {
+            let blocks_behind = head_age
+                .checked_div(spec.seconds_per_eth1_block)
+                .unwrap_or(0);
+
+            let part = f64::from(head_block.number as u32);
+            let whole = f64::from(head_block.number.saturating_add(blocks_behind) as u32);
+
+            if whole > 0.0 {
+                (part / whole) * 100.0
+            } else {
+                0.0
+            }
+        }
+    } else {
+        0.0
+    };
+
+    let lighthouse_is_cached_and_ready =
+        latest_cached_block_timestamp.map_or(false, |t| t >= voting_period_start_timestamp);
+
+    Some(Eth1SyncStatusData {
+        head_block_number,
+        head_block_timestamp,
+        latest_cached_block_number,
+        latest_cached_block_timestamp,
+        voting_period_start_timestamp,
+        eth1_node_sync_status_percentage,
+        lighthouse_is_cached_and_ready,
+    })
 }
 
 #[derive(Encode, Decode, Clone)]
@@ -143,6 +213,22 @@ where
         }
     }
 
+    /// Returns a status indicating how synced our caches are with the eth1 chain.
+    pub fn sync_status(
+        &self,
+        genesis_time: u64,
+        current_slot: Slot,
+        spec: &ChainSpec,
+    ) -> Option<Eth1SyncStatusData> {
+        get_sync_status::<E>(
+            self.backend.latest_cached_block().as_ref(),
+            self.backend.head_block().as_ref(),
+            genesis_time,
+            current_slot,
+            spec,
+        )
+    }
+
     /// Instantiate `Eth1Chain` from a persisted `SszEth1`.
     ///
     /// The `Eth1Chain` will have the same caches as the persisted `SszEth1`.
@@ -195,6 +281,14 @@ pub trait Eth1ChainBackend<T: EthSpec>: Sized + Send + Sync {
         spec: &ChainSpec,
     ) -> Result<Vec<Deposit>, Error>;
 
+    /// Returns the latest block stored in the cache. Used to obtain an idea of how up-to-date the
+    /// eth1 cache is.
+    fn latest_cached_block(&self) -> Option<Eth1Block>;
+
+    /// Returns the block at the head of the chain (ignoring follow distance, etc). Used to obtain
+    /// an idea of how up-to-date the node is.
+    fn head_block(&self) -> Option<Eth1Block>;
+
     /// Encode the `Eth1ChainBackend` instance to bytes.
     fn as_bytes(&self) -> Vec<u8>;
 
@@ -239,6 +333,14 @@ impl<T: EthSpec> Eth1ChainBackend<T> for DummyEth1ChainBackend<T> {
         _: &ChainSpec,
     ) -> Result<Vec<Deposit>, Error> {
         Ok(vec![])
+    }
+
+    fn latest_cached_block(&self) -> Option<Eth1Block> {
+        None
+    }
+
+    fn head_block(&self) -> Option<Eth1Block> {
+        None
     }
 
     /// Return empty Vec<u8> for dummy backend.
@@ -398,6 +500,14 @@ impl<T: EthSpec> Eth1ChainBackend<T> for CachingEth1Backend<T> {
                     .map(|(_deposit_root, deposits)| deposits)
             }
         }
+    }
+
+    fn latest_cached_block(&self) -> Option<Eth1Block> {
+        self.core.latest_cached_block()
+    }
+
+    fn head_block(&self) -> Option<Eth1Block> {
+        self.core.head_block()
     }
 
     /// Return encoded byte representation of the block and deposit caches.
